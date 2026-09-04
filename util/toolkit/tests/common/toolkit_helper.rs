@@ -455,6 +455,12 @@ impl ToolkitTestHelper {
 			.unwrap_or_else(|| panic!("expected `value` string in {}", result_file.display()))
 			.parse()
 			.unwrap_or_else(|e| panic!("invalid `value` in {}: {e}", result_file.display()));
+		// Temporary guard until compact-js-command accepts quoted bigint JSON fields.
+		const MAX_SAFE_INTEGER: u128 = (1 << 53) - 1;
+		assert!(
+			value <= MAX_SAFE_INTEGER,
+			"`value` {value} exceeds JavaScript's safe integer limit ({MAX_SAFE_INTEGER})"
+		);
 
 		format!(
 			r#"{{"nonce": "{}", "color": "{}", "value": {value}}}"#,
