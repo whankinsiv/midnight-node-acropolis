@@ -42,6 +42,15 @@ const localStateFor = (privateState: DaoPrivateState, round: bigint): LocalState
 const some = <T>(value: T): Maybe<T> => ({ is_some: true, value });
 const none = <T>(placeholder: T): Maybe<T> => ({ is_some: false, value: placeholder });
 
+// Compact serializes the value carried by an absent Maybe, so its fixed-depth path must be valid.
+const absentMerklePath: MerkleTreePath<Uint8Array> = {
+  leaf: new Uint8Array(32),
+  path: Array.from({ length: 10 }, () => ({
+    sibling: { field: 0n },
+    goes_left: false,
+  })),
+};
+
 const witnesses: Contract.Contract.Witnesses<DaoContract> = {
   // `public_key(sk)` of this is what the contract compares against `organizer`.
   local_secret_key: ({ privateState }) => [
@@ -79,7 +88,7 @@ const witnesses: Contract.Contract.Witnesses<DaoContract> = {
     return [
       privateState,
       path === undefined
-        ? none({ leaf: new Uint8Array(32), path: [] } as unknown as MerkleTreePath<Uint8Array>)
+        ? none(absentMerklePath)
         : some(path as MerkleTreePath<Uint8Array>),
     ];
   },

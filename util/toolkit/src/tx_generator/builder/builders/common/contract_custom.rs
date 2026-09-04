@@ -511,11 +511,14 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 		let mut transients_info: Vec<Box<dyn BuildTransient<DefaultDB, C>>> = vec![];
 
 		//   - Output
-		let shielded_wallets: Vec<ShieldedWallet<DefaultDB>> = self
+		let mut shielded_wallets: Vec<ShieldedWallet<DefaultDB>> = self
 			.shielded_destinations
 			.iter()
 			.filter_map(|addr| addr.try_into().ok())
 			.collect();
+		// The funding wallet supplies any shielded shortfall, so it must also be able to
+		// decrypt shielded outputs returned to it by the contract.
+		shielded_wallets.push(ShieldedWallet::default(self.funding_seed()));
 
 		let mut outputs_info: Vec<Box<dyn BuildOutput<DefaultDB, C>>> = Vec::new();
 		let mut encoded_output_infos: HashMap<CoinInfo, Box<EncodedOutputInfo>> = HashMap::new();

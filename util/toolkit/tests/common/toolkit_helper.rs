@@ -422,21 +422,6 @@ impl ToolkitTestHelper {
 		})
 	}
 
-	pub fn shielded_address(&self, seed: &str) -> String {
-		let args = ShowAddressArgs {
-			network: self.network.clone(),
-			seed: cli_parsers::SchemeSeed {
-				seed: cli_parsers::wallet_seed_decode(seed).expect("invalid wallet seed"),
-				scheme: midnight_node_ledger_helpers::UnshieldedSignatureScheme::Schnorr,
-			},
-			specific_address: SpecificAddressTypeArgs { shielded: true, ..Default::default() },
-		};
-		match show_address::execute(args) {
-			ShowAddress::SingleAddress(addr) => addr,
-			ShowAddress::Addresses(_) => panic!("expected single address"),
-		}
-	}
-
 	pub fn read_result(&self, result_file: &Path) -> serde_json::Value {
 		let raw = std::fs::read_to_string(result_file)
 			.unwrap_or_else(|e| panic!("failed to read {}: {e}", result_file.display()));
@@ -501,10 +486,7 @@ impl ToolkitTestHelper {
 				intent_files: vec![path_to_string(intent_file)],
 				utxo_inputs: vec![],
 				zswap_state_file: zswap_state_file.map(path_to_string),
-				shielded_destinations: vec![
-					cli_parsers::wallet_address(&self.shielded_address(funding_seed))
-						.expect("invalid shielded wallet address"),
-				],
+				shielded_destinations: vec![],
 			},
 			dry_run: false,
 		};
