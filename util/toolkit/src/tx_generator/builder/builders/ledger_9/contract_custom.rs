@@ -13,20 +13,20 @@ use ledger_helpers_local::coin_structure::{
 };
 use ledger_helpers_local::{
 	BuildInput, BuildIntent, BuildOutput, BuildTransient, BuildUtxoOutput, BuildUtxoSpend,
-	BuilderContext, ClaimedUnshieldedSpendsKey, CoinInfo, CoinSelectionStrategy, ContractAction,
-	ContractAddress, ContractEffects, DB, DefaultDB, EncryptionPublicKey, HashOutput, Input,
-	InputInfo, IntentCustom, IntentInfo, Nullifier, OfferInfo, Output, ProofPreimage,
-	ProofPreimageMarker, ProofProvider, PublicAddress, Recipient, Segment,
-	ShieldedCoinSelectionError, ShieldedTokenType, ShieldedWallet, StdRng, TokenInfo, TokenType,
-	TransactionWithContext, Transient, UnshieldedOfferInfo, UnshieldedWallet, UtxoId,
-	UtxoOutputInfo, UtxoSpendInfo, Wallet, WalletAddress, WalletSeed, zswap,
+	BuilderContext, ClaimedUnshieldedSpendsKey, CoinInfo, ContractAction, ContractAddress,
+	ContractEffects, DB, DefaultDB, EncryptionPublicKey, HashOutput, Input, InputInfo,
+	IntentCustom, IntentInfo, Nullifier, OfferInfo, Output, ProofPreimage, ProofPreimageMarker,
+	ProofProvider, PublicAddress, Recipient, Segment, ShieldedCoinSelectionError,
+	ShieldedTokenType, ShieldedWallet, StdRng, TokenInfo, TokenType, TransactionWithContext,
+	Transient, UnshieldedOfferInfo, UnshieldedWallet, UtxoId, UtxoOutputInfo, UtxoSpendInfo,
+	Wallet, WalletAddress, WalletSeed, zswap,
 };
 use midnight_node_ledger_helpers::fork::raw_block_data::SerializedTxBatches;
 use midnight_node_ledger_helpers::ledger_9 as ledger_helpers_local;
 use rand::SeedableRng;
 use std::{
 	cmp::Ordering,
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	sync::Arc,
 };
 
@@ -205,6 +205,75 @@ fn claims_commitment(effects: &ContractEffects<DefaultDB>, commitment: CoinCommi
 
 fn claims_nullifier(effects: &ContractEffects<DefaultDB>, nullifier: Nullifier) -> bool {
 	effects.claimed_nullifiers.iter().any(|claimed| **claimed == nullifier)
+}
+
+/// Resolves a spent coin's owner from the transcript that claims its nullifier.
+///
+/// A bundled intent can call several contracts; deriving every nullifier with the first
+/// contract address would make later contract-owned spends invalid.
+fn input_owner(
+	effects: &[SegmentedEffects],
+	coin_info: &CoinInfo,
+) -> Option<(ContractAddress, Nullifier)> {
+	effects.iter().find_map(|effect| {
+		let nullifier = coin_info.nullifier(&SenderEvidence::Contract(effect.address));
+		claims_nullifier(&effect.effects, nullifier).then_some((effect.address, nullifier))
+	})
+}
+
+/// Selects funding coins for one segment, excluding coins selected for earlier segments.
+///
+/// The wallet advances only while building offers, so selection must reserve nullifiers to
+/// prevent independent segment balances from choosing the same coin. The ordering matches
+/// `CoinSelectionStrategy::LargestFirst`.
+fn select_funding_coins<C: BuilderContext<DefaultDB>>(
+	context: &Arc<C>,
+	seed: &WalletSeed,
+	required: u128,
+	token_type: ShieldedTokenType,
+	reserved: &mut HashSet<Nullifier>,
+) -> Result<(Vec<InputInfo<WalletSeed>>, u128), CustomContractBuilderError> {
+	let mut available: Vec<InputInfo<WalletSeed>> =
+		context.with_wallet_from_seed(seed.clone(), |wallet| {
+			wallet
+				.shielded
+				.state
+				.coins
+				.iter()
+				.filter(|(nullifier, coin)| {
+					coin.type_ == token_type && !reserved.contains(nullifier)
+				})
+				.map(|(nullifier, coin)| InputInfo {
+					origin: seed.clone(),
+					token_type,
+					value: coin.value,
+					nullifier: Some(nullifier),
+				})
+				.collect()
+		});
+	available.sort_by_key(|input| std::cmp::Reverse(input.value));
+
+	let mut total: u128 = 0;
+	let mut selected = Vec::new();
+	for input in available {
+		total = total
+			.checked_add(input.value)
+			.ok_or(CustomContractBuilderError::ShieldedBalanceOverflow)?;
+		if let Some(nullifier) = input.nullifier {
+			reserved.insert(nullifier);
+		}
+		selected.push(input);
+		if let Some(change) = total.checked_sub(required) {
+			return Ok((selected, change));
+		}
+	}
+	Err(CustomContractBuilderError::ShieldedCoinSelection(
+		ShieldedCoinSelectionError::InsufficientBalance {
+			required,
+			token_type,
+			seed: seed.clone(),
+		},
+	))
 }
 
 /// Matches the ledger's claim-based offer partitioning.
@@ -547,14 +616,20 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 			}
 
 			if !zswap_state.inputs.is_empty() {
-				let contract_address = contract_intent
+				// Only a fallback: `input_owner` resolves the real owner per input below.
+				let fallback_address = contract_intent
 					.find_contract_address()
 					.expect("Contract address should be set");
 				let chain_zswap_state = context.zswap_state().await;
 				for encoded_input in zswap_state.inputs {
 					let coin_info: CoinInfo = (&encoded_input).into();
-					let nullifier =
-						coin_info.nullifier(&SenderEvidence::Contract(contract_address));
+					let (owner, nullifier) =
+						input_owner(&effects, &coin_info).unwrap_or_else(|| {
+							(
+								fallback_address,
+								coin_info.nullifier(&SenderEvidence::Contract(fallback_address)),
+							)
+						});
 
 					if let Some(mut encoded_output_info) = encoded_output_infos.remove(&coin_info) {
 						// A transient is fallible if either its commitment or nullifier is claimed.
@@ -579,7 +654,7 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 							EncodedInputInfo {
 								encoded_qualified_info: encoded_input,
 								segment,
-								contract_address,
+								contract_address: owner,
 								chain_zswap_state: chain_zswap_state.clone(),
 							},
 						));
@@ -608,18 +683,20 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 			)
 			.collect();
 
+		// Coins picked for one segment must not be picked again for another.
+		let mut reserved_funding: HashSet<Nullifier> = HashSet::new();
 		for segment in balancing_segments {
 			let offer = offers.entry(segment).or_insert_with(empty_offer);
 			let imbalances = shielded_imbalances(segment, &offer.outputs, &offer.inputs, &effects)?;
 			for (token_type, imbalance) in imbalances {
 				let change = match imbalance {
 					Imbalance::Shortfall(required) => {
-						let (funding_inputs, change) = InputInfo::coins_to_cover_value(
-							self.context.clone(),
-							self.funding_seed(),
+						let (funding_inputs, change) = select_funding_coins(
+							&self.context,
+							&self.funding_seed(),
 							required,
 							token_type,
-							CoinSelectionStrategy::LargestFirst,
+							&mut reserved_funding,
 						)?;
 						let offer = offers.entry(segment).or_insert_with(empty_offer);
 						for funding_input in funding_inputs {
