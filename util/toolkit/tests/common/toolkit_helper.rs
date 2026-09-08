@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use midnight_node_toolkit::{
 	cli_parsers,
@@ -327,6 +328,14 @@ impl ToolkitTestHelper {
 		}
 	}
 
+	/// Work-dir stem for one `generate_intent_*` call's outputs; the sequence number keeps
+	/// repeat calls to the same circuit from overwriting each other.
+	fn out_prefix(&self, label: &str) -> PathBuf {
+		static SEQ: AtomicUsize = AtomicUsize::new(0);
+		let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+		self.work_dir.path().join(format!("{seq:03}_{label}"))
+	}
+
 	pub async fn generate_intent_deploy(
 		&self,
 		config_file: &Path,
@@ -343,8 +352,9 @@ impl ToolkitTestHelper {
 		constructor_args: &[&str],
 	) -> Result<DeployOutput, Box<dyn std::error::Error + Send + Sync>> {
 		let intent = self.work_dir.path().join("deploy_intent.bin");
-		let private_state = self.work_dir.path().join("deploy_private_state.json");
-		let zswap_state = self.work_dir.path().join("deploy_zswap_state.json");
+		let out = self.out_prefix("deploy");
+		let private_state = out.with_extension("private_state.json");
+		let zswap_state = out.with_extension("zswap_state.json");
 
 		let args = GenerateIntentArgs {
 			js_command: JsCommand::Deploy(DeployCommandArgs {
@@ -378,11 +388,11 @@ impl ToolkitTestHelper {
 		call: CircuitCall<'_>,
 	) -> Result<CircuitOutput, Box<dyn std::error::Error + Send + Sync>> {
 		let CircuitCall { circuit_id, call_args } = call;
-		let out_intent = self.work_dir.path().join(format!("{circuit_id}_intent.bin"));
-		let out_private_state =
-			self.work_dir.path().join(format!("{circuit_id}_private_state.json"));
-		let out_zswap_state = self.work_dir.path().join(format!("{circuit_id}_zswap_state.json"));
-		let out_result = self.work_dir.path().join(format!("{circuit_id}_result.json"));
+		let out = self.out_prefix(circuit_id);
+		let out_intent = out.with_extension("intent.bin");
+		let out_private_state = out.with_extension("private_state.json");
+		let out_zswap_state = out.with_extension("zswap_state.json");
+		let out_result = out.with_extension("result.json");
 
 		let args = GenerateIntentArgs {
 			js_command: JsCommand::Circuit(CircuitCommandArgs {
