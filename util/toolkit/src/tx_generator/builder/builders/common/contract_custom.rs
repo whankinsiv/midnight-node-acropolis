@@ -1,9 +1,12 @@
 use super::build_txs_ext::BuildTxsExt;
+use super::ledger_helpers_local::coin_structure::{
+	coin::Commitment as CoinCommitment, transfer::SenderEvidence,
+};
 use super::ledger_helpers_local::{
 	BuildInput, BuildIntent, BuildOutput, BuildTransient, BuildUtxoOutput, BuildUtxoSpend,
 	BuilderContext, ClaimedUnshieldedSpendsKey, CoinInfo, CoinSelectionStrategy, ContractAction,
 	ContractAddress, ContractEffects, DB, DefaultDB, EncryptionPublicKey, HashOutput, Input,
-	InputInfo, IntentCustom, IntentInfo, OfferInfo, Output, OutputInfo, ProofPreimage,
+	InputInfo, IntentCustom, IntentInfo, Nullifier, OfferInfo, Output, ProofPreimage,
 	ProofPreimageMarker, ProofProvider, PublicAddress, Recipient, Segment,
 	ShieldedCoinSelectionError, ShieldedTokenType, ShieldedWallet, StdRng, TokenInfo, TokenType,
 	TransactionWithContext, Transient, UnshieldedOfferInfo, UnshieldedWallet, UtxoId,
@@ -21,7 +24,8 @@ use async_trait::async_trait;
 use midnight_node_ledger_helpers::fork::raw_block_data::SerializedTxBatches;
 use rand::SeedableRng;
 use std::{
-	collections::{BTreeMap, HashMap},
+	cmp::Ordering,
+	collections::{BTreeMap, BTreeSet, HashMap},
 	sync::Arc,
 };
 
@@ -162,23 +166,10 @@ fn add_shielded_token_value(
 
 const GUARANTEED_SEGMENT: u16 = Segment::Guaranteed as u16;
 
-/// One call transcript's effects, tagged with its contract and the segment the ledger accounts
-/// it under. The ledger balances each segment independently, so both have to survive
-/// aggregation: the contract gives a mint its token type, the segment gives it its tier.
 struct SegmentedEffects {
 	segment: u16,
 	address: ContractAddress,
 	effects: ContractEffects<DefaultDB>,
-}
-
-impl SegmentedEffects {
-	/// Whether this transcript moved any shielded value.
-	fn moves_shielded_value(&self) -> bool {
-		!self.effects.shielded_mints.is_empty()
-			|| !self.effects.claimed_shielded_receives.is_empty()
-			|| !self.effects.claimed_shielded_spends.is_empty()
-			|| !self.effects.claimed_nullifiers.is_empty()
-	}
 }
 
 fn call_effects(intent: &IntentCustom<DefaultDB>, fallible_segment: u16) -> Vec<SegmentedEffects> {
@@ -202,18 +193,42 @@ fn call_effects(intent: &IntentCustom<DefaultDB>, fallible_segment: u16) -> Vec<
 	effects
 }
 
-/// The shielded value the calling wallet must supply, per token type: `outputs - inputs -
-/// mints`, floored at zero.
-///
-/// A `receiveShielded` output is one the caller has to cover; a `mintShieldedToken` output is
-/// backed by the contract instead, recorded in `Effects::shielded_mints`. Coins the contract
-/// owns enter as inputs and pay for themselves, and transients net to zero.
-fn shielded_shortfall<C: BuilderContext<DefaultDB>>(
+fn empty_offer<C: BuilderContext<DefaultDB>>() -> OfferInfo<DefaultDB, C> {
+	OfferInfo { inputs: Vec::new(), outputs: Vec::new(), transients: Vec::new() }
+}
+
+fn claims_commitment(effects: &ContractEffects<DefaultDB>, commitment: CoinCommitment) -> bool {
+	effects.claimed_shielded_receives.iter().any(|claimed| **claimed == commitment)
+		|| effects.claimed_shielded_spends.iter().any(|claimed| **claimed == commitment)
+}
+
+fn claims_nullifier(effects: &ContractEffects<DefaultDB>, nullifier: Nullifier) -> bool {
+	effects.claimed_nullifiers.iter().any(|claimed| **claimed == nullifier)
+}
+
+/// Matches the ledger's claim-based offer partitioning.
+fn shielded_segment<F>(effects: &[SegmentedEffects], claims: F) -> u16
+where
+	F: Fn(&ContractEffects<DefaultDB>) -> bool,
+{
+	effects
+		.iter()
+		.find(|effect| effect.segment != GUARANTEED_SEGMENT && claims(&effect.effects))
+		.map_or(GUARANTEED_SEGMENT, |effect| effect.segment)
+}
+
+#[derive(Clone, Copy)]
+enum Imbalance {
+	Shortfall(u128),
+	Surplus(u128),
+}
+
+fn shielded_imbalances<C: BuilderContext<DefaultDB>>(
 	segment: u16,
 	outputs: &[Box<dyn BuildOutput<DefaultDB, C>>],
 	inputs: &[Box<dyn BuildInput<DefaultDB, C>>],
 	effects: &[SegmentedEffects],
-) -> Result<Vec<(ShieldedTokenType, u128)>, CustomContractBuilderError> {
+) -> Result<Vec<(ShieldedTokenType, Imbalance)>, CustomContractBuilderError> {
 	let mut owed = BTreeMap::new();
 	for output in outputs {
 		add_shielded_token_value(&mut owed, output.token_type(), output.value())?;
@@ -223,8 +238,7 @@ fn shielded_shortfall<C: BuilderContext<DefaultDB>>(
 	for input in inputs {
 		add_shielded_token_value(&mut covered, input.token_type(), input.value())?;
 	}
-	// Only mints in this segment cover it: a fallible mint is conditional on its segment
-	// applying, so it cannot back a guaranteed output.
+	// Mints only cover outputs in their own segment.
 	for effect in effects.iter().filter(|e| e.segment == segment) {
 		for entry in effect.effects.shielded_mints.iter() {
 			let (domain_sep, value) = &*entry;
@@ -237,11 +251,18 @@ fn shielded_shortfall<C: BuilderContext<DefaultDB>>(
 	}
 
 	Ok(owed
+		.keys()
+		.chain(covered.keys())
+		.copied()
+		.collect::<BTreeSet<_>>()
 		.into_iter()
-		.filter_map(|(token_type, total)| {
-			match total.saturating_sub(covered.get(&token_type).copied().unwrap_or(0)) {
-				0 => None,
-				shortfall => Some((token_type, shortfall)),
+		.filter_map(|token_type| {
+			let owed = owed.get(&token_type).copied().unwrap_or(0);
+			let covered = covered.get(&token_type).copied().unwrap_or(0);
+			match owed.cmp(&covered) {
+				Ordering::Equal => None,
+				Ordering::Greater => Some((token_type, Imbalance::Shortfall(owed - covered))),
+				Ordering::Less => Some((token_type, Imbalance::Surplus(covered - owed))),
 			}
 		})
 		.collect())
@@ -269,8 +290,6 @@ pub enum CustomContractBuilderError {
 	ShieldedBalanceOverflow,
 	#[error("failed to select shielded coins to fund the contract call")]
 	ShieldedCoinSelection(#[from] ShieldedCoinSelectionError),
-	#[error("segment {0} moves shielded value in a fallible transcript, which is not supported")]
-	FallibleShieldedEffects(u16),
 }
 
 pub struct CustomContractBuilder<C: BuilderContext<DefaultDB>> {
@@ -504,32 +523,25 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 
 		tx_info.set_intents(intents);
 
-		//   - Input
-		let mut inputs_info: Vec<Box<dyn BuildInput<DefaultDB, C>>> = vec![];
-
-		//   - Transient
-		let mut transients_info: Vec<Box<dyn BuildTransient<DefaultDB, C>>> = vec![];
-
-		//   - Output
 		let mut shielded_wallets: Vec<ShieldedWallet<DefaultDB>> = self
 			.shielded_destinations
 			.iter()
 			.filter_map(|addr| addr.try_into().ok())
 			.collect();
-		// The funding wallet supplies any shielded shortfall, so it must also be able to
-		// decrypt shielded outputs returned to it by the contract.
 		shielded_wallets.push(ShieldedWallet::default(self.funding_seed()));
 
-		let mut outputs_info: Vec<Box<dyn BuildOutput<DefaultDB, C>>> = Vec::new();
+		let effects = call_effects(&contract_intent, contract_segment);
+		let mut offers: BTreeMap<u16, OfferInfo<DefaultDB, C>> = BTreeMap::new();
 		let mut encoded_output_infos: HashMap<CoinInfo, Box<EncodedOutputInfo>> = HashMap::new();
 
 		if let Some(zswap_state) = zswap_state {
-			for encoded_output in zswap_state.outputs.into_iter() {
-				// NOTE: Using segment 0 here assumes that the contract is executing a guaranteed
-				// transcript
+			for encoded_output in zswap_state.outputs {
 				let coin_info: CoinInfo = (&encoded_output).into();
+				let recipient: Recipient = (&encoded_output.recipient).into();
+				let commitment = coin_info.commitment(&recipient);
+				let segment = shielded_segment(&effects, |e| claims_commitment(e, commitment));
 				let encoded_output_info =
-					EncodedOutputInfo::new(encoded_output, 1, &shielded_wallets);
+					EncodedOutputInfo::new(encoded_output, segment, &shielded_wallets);
 				encoded_output_infos.insert(coin_info, Box::new(encoded_output_info));
 			}
 
@@ -538,73 +550,109 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 					.find_contract_address()
 					.expect("Contract address should be set");
 				let chain_zswap_state = context.zswap_state().await;
-				for encoded_input in zswap_state.inputs.into_iter() {
+				for encoded_input in zswap_state.inputs {
 					let coin_info: CoinInfo = (&encoded_input).into();
+					let nullifier =
+						coin_info.nullifier(&SenderEvidence::Contract(contract_address));
 
-					if let Some(encoded_output_info) = encoded_output_infos.get(&coin_info) {
-						let transient = EncodedTransientInfo {
-							encoded_qualified_info: encoded_input,
-							segment: 0,
-							encoded_output_info: encoded_output_info.clone(),
-						};
-						transients_info.push(Box::new(transient));
-						encoded_output_infos.remove(&coin_info);
+					if let Some(mut encoded_output_info) = encoded_output_infos.remove(&coin_info) {
+						// A transient is fallible if either its commitment or nullifier is claimed.
+						let recipient: Recipient =
+							(&encoded_output_info.encoded_output.recipient).into();
+						let commitment = coin_info.commitment(&recipient);
+						let segment = shielded_segment(&effects, |e| {
+							claims_commitment(e, commitment) || claims_nullifier(e, nullifier)
+						});
+						encoded_output_info.segment = segment;
+						offers.entry(segment).or_insert_with(empty_offer).transients.push(
+							Box::new(EncodedTransientInfo {
+								encoded_qualified_info: encoded_input,
+								segment,
+								encoded_output_info,
+							}),
+						);
 					} else {
-						let input = EncodedInputInfo {
-							encoded_qualified_info: encoded_input,
-							segment: 0,
-							contract_address,
-							chain_zswap_state: chain_zswap_state.clone(),
-						};
-						inputs_info.push(Box::new(input));
+						let segment =
+							shielded_segment(&effects, |e| claims_nullifier(e, nullifier));
+						offers.entry(segment).or_insert_with(empty_offer).inputs.push(Box::new(
+							EncodedInputInfo {
+								encoded_qualified_info: encoded_input,
+								segment,
+								contract_address,
+								chain_zswap_state: chain_zswap_state.clone(),
+							},
+						));
 					}
 				}
 			}
 
-			for encoded_output_info in encoded_output_infos.values() {
-				outputs_info.push(encoded_output_info.clone());
+			for encoded_output_info in encoded_output_infos.into_values() {
+				let segment = encoded_output_info.segment;
+				offers
+					.entry(segment)
+					.or_insert_with(empty_offer)
+					.outputs
+					.push(encoded_output_info);
 			}
 		}
 
-		// Cover the coins the circuit took from the caller, or the offer is unbalanced and
-		// the transaction is rejected.
-		if !outputs_info.is_empty() {
-			let effects = call_effects(&contract_intent, contract_segment);
-			// Every zswap element here goes into the guaranteed offer, so a transcript that
-			// moves shielded value in a fallible segment cannot be balanced correctly.
-			if let Some(fallible) = effects
-				.iter()
-				.find(|e| e.segment != GUARANTEED_SEGMENT && e.moves_shielded_value())
-			{
-				return Err(CustomContractBuilderError::FallibleShieldedEffects(fallible.segment));
-			}
-			let shortfalls =
-				shielded_shortfall(GUARANTEED_SEGMENT, &outputs_info, &inputs_info, &effects)?;
-			for (token_type, required) in shortfalls {
-				let (funding_inputs, change) = InputInfo::coins_to_cover_value(
-					self.context.clone(),
-					self.funding_seed(),
-					required,
-					token_type,
-					CoinSelectionStrategy::LargestFirst,
-				)?;
-				for funding_input in funding_inputs {
-					inputs_info.push(Box::new(funding_input));
-				}
+		let balancing_segments: BTreeSet<u16> = offers
+			.keys()
+			.copied()
+			.chain(
+				effects
+					.iter()
+					.filter(|effect| !effect.effects.shielded_mints.is_empty())
+					.map(|effect| effect.segment),
+			)
+			.collect();
+
+		for segment in balancing_segments {
+			let offer = offers.entry(segment).or_insert_with(empty_offer);
+			let imbalances = shielded_imbalances(segment, &offer.outputs, &offer.inputs, &effects)?;
+			for (token_type, imbalance) in imbalances {
+				let change = match imbalance {
+					Imbalance::Shortfall(required) => {
+						let (funding_inputs, change) = InputInfo::coins_to_cover_value(
+							self.context.clone(),
+							self.funding_seed(),
+							required,
+							token_type,
+							CoinSelectionStrategy::LargestFirst,
+						)?;
+						let offer = offers.entry(segment).or_insert_with(empty_offer);
+						for funding_input in funding_inputs {
+							offer.inputs.push(Box::new(SegmentedFundingInputInfo {
+								input: funding_input,
+								segment,
+							}));
+						}
+						change
+					},
+					Imbalance::Surplus(excess) => excess,
+				};
 				if change > 0 {
-					outputs_info.push(Box::new(OutputInfo {
-						destination: self.funding_seed(),
-						token_type,
-						value: change,
-					}));
+					offers.entry(segment).or_insert_with(empty_offer).outputs.push(Box::new(
+						SegmentedFundingOutputInfo {
+							destination: self.funding_seed(),
+							token_type,
+							value: change,
+							segment,
+						},
+					));
 				}
 			}
 		}
 
-		let offer_info =
-			OfferInfo { inputs: inputs_info, outputs: outputs_info, transients: transients_info };
-
-		tx_info.set_guaranteed_offer(offer_info);
+		offers.retain(|_, offer| {
+			!offer.inputs.is_empty() || !offer.outputs.is_empty() || !offer.transients.is_empty()
+		});
+		if let Some(guaranteed_offer) = offers.remove(&GUARANTEED_SEGMENT) {
+			tx_info.set_guaranteed_offer(guaranteed_offer);
+		}
+		if !offers.is_empty() {
+			tx_info.set_fallible_offers(offers.into_iter().collect());
+		}
 
 		tx_info.set_funding_seeds(vec![self.funding_seed()]);
 		tx_info.use_mock_proofs_for_fees(false);
@@ -621,5 +669,80 @@ impl<C: BuilderContext<DefaultDB>> BuildTxs for CustomContractBuilder<C> {
 		let tx_with_context = TransactionWithContext::new(tx, None);
 
 		Ok(super::tx_serialization::build_single(tx_with_context))
+	}
+}
+/// A funding-wallet input assigned to the transcript segment that requires it.
+struct SegmentedFundingInputInfo {
+	input: InputInfo<WalletSeed>,
+	segment: u16,
+}
+
+impl TokenInfo for SegmentedFundingInputInfo {
+	fn token_type(&self) -> ShieldedTokenType {
+		self.input.token_type()
+	}
+
+	fn value(&self) -> u128 {
+		self.input.value()
+	}
+}
+
+impl<D: DB + Clone, C: BuilderContext<D>> BuildInput<D, C> for SegmentedFundingInputInfo {
+	fn build(
+		&mut self,
+		rng: &mut rand::prelude::StdRng,
+		context: Arc<C>,
+	) -> Input<ProofPreimage, D> {
+		context.with_wallet_from_seed(self.input.origin.clone(), |wallet| {
+			let coin = self.input.min_match_coin(&wallet.shielded.state);
+			self.input.value = coin.value;
+
+			let (updated_wallet, input) = wallet
+				.shielded
+				.state
+				.spend(rng, wallet.shielded.secret_keys(), &coin, Some(self.segment))
+				.expect("failed to spend funding coin");
+			wallet.shielded.state = updated_wallet;
+			input
+		})
+	}
+}
+
+/// A funding-wallet change output assigned to the transcript segment that produced it.
+struct SegmentedFundingOutputInfo {
+	destination: WalletSeed,
+	token_type: ShieldedTokenType,
+	value: u128,
+	segment: u16,
+}
+
+impl TokenInfo for SegmentedFundingOutputInfo {
+	fn token_type(&self) -> ShieldedTokenType {
+		self.token_type
+	}
+
+	fn value(&self) -> u128 {
+		self.value
+	}
+}
+
+impl<D: DB + Clone, C: BuilderContext<D>> BuildOutput<D, C> for SegmentedFundingOutputInfo {
+	fn build(&self, rng: &mut rand::prelude::StdRng, context: Arc<C>) -> Output<ProofPreimage, D> {
+		context.with_wallet_from_seed(self.destination.clone(), |wallet| {
+			let coin_info = CoinInfo::new(rng, self.value, self.token_type);
+			wallet.shielded.state = wallet
+				.shielded
+				.state
+				.watch_for(&wallet.shielded.secret_keys().coin_public_key(), &coin_info);
+
+			Output::new(
+				rng,
+				&coin_info,
+				Some(self.segment),
+				&wallet.shielded.secret_keys().coin_public_key(),
+				Some(wallet.shielded.secret_keys().enc_public_key()),
+			)
+			.expect("failed to construct funding change output")
+		})
 	}
 }
